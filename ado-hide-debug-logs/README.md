@@ -34,6 +34,11 @@ The script's header points `@updateURL` / `@downloadURL` at `raw.githubuserconte
 
 Tested live on `arkadiumarena.visualstudio.com` build log view (Azure DevOps Server hosted instance) — `.line-row` virtual scroller, SPA task switching, ANSI-colored output. Works on both `dev.azure.com/*` and `*.visualstudio.com/*` URLs (see `@match`).
 
+## Known limitations
+
+- **Scrollbar reflects original log size**, not the filtered one. ADO computes the scroll container's height from total log lines, and short of replacing the whole virtual scroller there's no way to shrink it. So you scroll over the same physical distance, just with fewer non-debug rows visible per page. For a 1000-line log that's 80% debug, you still scroll through 1000 lines' worth of scrollbar.
+- **No gaps within a viewport** — the sequential-anchor pack handles intermediate virtualized-away debug rows correctly. But between adjacent virtualization batches there can be a brief one-frame flash as ADO renders rows at their original positions before our pack shifts them up.
+
 ## Tweaking the marker
 
 If you ever need to filter on something else (`##[warning]`, `##[command]`, a custom prefix), change `DEBUG_MARKER` at the top of the IIFE.
