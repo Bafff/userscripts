@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADO Hide Debug Logs
 // @namespace    https://github.com/Bafff/userscripts
-// @version      0.3.0
-// @description  Toggle ##[debug] lines in Azure DevOps pipeline log viewer with one global button covering all jobs/tasks/stages. Sequentially re-packs visible rows so gaps don't appear even when intermediate debug rows are virtualized off-screen.
+// @version      0.4.0
+// @description  Toggle ##[debug] lines in Azure DevOps pipeline log viewer with one global button covering all jobs/tasks/stages. Visible non-debug rows always stick to the top of the viewport — no leading whitespace where hidden debug rows used to live.
 // @author       baf
 // @match        https://dev.azure.com/*/_build/results*
 // @match        https://*.visualstudio.com/*/_build/results*
@@ -21,10 +21,10 @@
   const BTN_ID = 'tm-ado-hide-debug-btn';
   const DEBUG_MARKER = '##[debug]';
   const SLOT_SEL = '.bolt-fixed-height-list-row';
+  const LOG_READER_SEL = '.log-reader';
 
   // Persistent line classification across the lifetime of the page.
   // key = `<data-lsec>:<data-line>` → { lineIdx, lsec, isDebug }
-  // Built incrementally as rows enter the DOM; survives virtual-scroller eviction.
   const lineMap = new Map();
   let rowHeight = 20;
 
@@ -47,6 +47,7 @@
   document.head.appendChild(style);
 
   const isHidden = () => localStorage.getItem(STORAGE_KEY) === '1';
+  const getScrollTop = () => document.querySelector(LOG_READER_SEL)?.scrollTop || 0;
 
   function lineInfo(slot) {
     const lineRow = slot.querySelector('.line-row');
@@ -95,16 +96,14 @@
     }
   }
 
-  // Each row's "original" position in ADO's layout is derived from its line index.
-  const origTopOf = (info) => (info.lineIdx - 1) * rowHeight;
-
   let packing = false;
 
-  // Sequential-anchor pack: visible (non-debug) rows in the rendered batch are placed at
-  // anchor, anchor+rowHeight, anchor+2*rowHeight, ... where anchor = the first non-debug
-  // row's original top. This keeps packed content where the user is scrolled to, and
-  // — because we don't subtract a `debugs-in-batch` count — it works correctly even
-  // when intermediate debug rows are off-screen / virtualized away.
+  // anchor = current scrollTop. Visible non-debug rows in the rendered batch are
+  // placed at anchor, anchor+rowHeight, ... — so they always sit at the top of the
+  // viewport. No leading whitespace where hidden debug rows used to live.
+  // Side effect: scrollbar reflects ADO's original log length, not the filtered one.
+  // You'll scroll over a larger range than the visible content suggests; ADO's
+  // virtualizer will render new batches as you go, and we pack each batch.
   function applyPack() {
     if (packing) return;
     if (!isHidden()) return;
@@ -122,9 +121,7 @@
       if (items.length === 0) return;
       items.sort((a, b) => a.info.lineIdx - b.info.lineIdx);
 
-      const firstND = items.find((it) => !it.isDebug);
-      if (!firstND) return;
-      const anchor = origTopOf(firstND.info);
+      const anchor = getScrollTop();
 
       let i = 0;
       for (const it of items) {
@@ -146,7 +143,7 @@
     try {
       document.querySelectorAll(SLOT_SEL + '[data-tm-applied-top]').forEach((s) => {
         const info = lineInfo(s);
-        if (info) s.style.setProperty('top', origTopOf(info) + 'px');
+        if (info) s.style.setProperty('top', (info.lineIdx - 1) * rowHeight + 'px');
         delete s.dataset.tmAppliedTop;
       });
     } finally {
@@ -154,8 +151,8 @@
     }
   }
 
-  // Coalesce observer-driven work into one rAF — direct synchronous re-entry would
-  // race with ADO's React-based render cycle and lock the page.
+  // Coalesce observer-driven + scroll-driven work into one rAF. Direct synchronous
+  // re-entry races with ADO's React-based render cycle and freezes the page.
   let scheduled = false;
   function schedule() {
     if (scheduled) return;
@@ -195,6 +192,23 @@
       attributes: true,
       attributeFilter: ['style'],
     });
+    // Also re-pack on scroll — scroll alone may not produce DOM mutations if the
+    // rendered batch is wide enough to span the entire visible delta.
+    const attachScroll = () => {
+      const sc = document.querySelector(LOG_READER_SEL);
+      if (sc && !sc.dataset.tmScrollHooked) {
+        sc.addEventListener('scroll', schedule, { passive: true });
+        sc.dataset.tmScrollHooked = '1';
+      }
+    };
+    attachScroll();
+    // The log-reader may not exist on initial load (SPA); poll until it appears.
+    let attempts = 0;
+    const tick = setInterval(() => {
+      attachScroll();
+      attempts++;
+      if (attempts > 60) clearInterval(tick); // ~30s
+    }, 500);
   }
 
   function updateBtn(btn) {
