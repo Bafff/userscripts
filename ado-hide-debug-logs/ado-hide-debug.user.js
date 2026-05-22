@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADO Hide Debug Logs
 // @namespace    https://github.com/Bafff/userscripts
-// @version      0.4.0
-// @description  Toggle ##[debug] lines in Azure DevOps pipeline log viewer with one global button covering all jobs/tasks/stages. Visible non-debug rows always stick to the top of the viewport — no leading whitespace where hidden debug rows used to live.
+// @version      0.5.0
+// @description  Hide ##[debug] lines in Azure DevOps pipeline log viewer. On toggle, extracts the full log via auto-scroll and renders a compact non-debug-only view in place of ADO's virtualized list — so distant non-debug lines are visible without scrolling through hidden debug rows.
 // @author       baf
 // @match        https://dev.azure.com/*/_build/results*
 // @match        https://*.visualstudio.com/*/_build/results*
@@ -16,24 +16,42 @@
   'use strict';
 
   const STORAGE_KEY = 'ado-hide-debug-logs:hidden';
-  const HIDE_CLASS = 'tm-ado-hide-debug';
-  const DEBUG_LINE_CLASS = 'tm-ado-debug-line';
+  const COMPACT_ID = 'tm-ado-compact-view';
   const BTN_ID = 'tm-ado-hide-debug-btn';
   const DEBUG_MARKER = '##[debug]';
-  const SLOT_SEL = '.bolt-fixed-height-list-row';
   const LOG_READER_SEL = '.log-reader';
+  const LIST_SEL = '.bolt-fixed-height-list';
+  const SLOT_SEL = '.bolt-fixed-height-list-row';
 
-  // Persistent line classification across the lifetime of the page.
-  // key = `<data-lsec>:<data-line>` → { lineIdx, lsec, isDebug }
-  const lineMap = new Map();
-  let rowHeight = 20;
+  // ─── State ───────────────────────────────────────────────────────────────
+  // 'off'         — debug rows visible, ADO's list shown as normal
+  // 'extracting'  — auto-scrolling to capture every line; button disabled
+  // 'compact'     — custom view shown, ADO's list hidden
+  let state = 'off';
+  // Per-task extraction cache. key = `${lsec}:${lineIdx}` → captured row data.
+  // Cleared on task switch.
+  let extracted = new Map();
+  // Order non-debug entries by lineIdx within their lsec; preserve lsec order
+  // as we see them (matters for tasks with multiple log sections).
+  let lsecOrder = []; // [lsec, ...]
+  let currentTaskKey = ''; // detected from URL `t=` param
+  let savedScrollTop = 0;
+  let extractAbort = false;
 
+  // ─── Styles ──────────────────────────────────────────────────────────────
   const style = document.createElement('style');
   style.textContent = `
-    body.${HIDE_CLASS} ${SLOT_SEL}:has(.${DEBUG_LINE_CLASS}) { display: none !important; }
-    body.${HIDE_CLASS} .${DEBUG_LINE_CLASS} { display: none !important; }
+    #${COMPACT_ID} {
+      padding: 0; margin: 0;
+      background: inherit;
+      font-family: inherit; font-size: inherit; color: inherit;
+    }
+    #${COMPACT_ID} .tm-ado-compact-row { display: block; white-space: pre; padding: 0; }
+    #${COMPACT_ID} .tm-ado-compact-row > .line-row { display: block; }
+    /* Hide ADO's virtualized list while the compact view is up */
+    .${BTN_ID}-compact-on ${LOG_READER_SEL} > ${LIST_SEL} { display: none !important; }
     #${BTN_ID} {
-      position: fixed; right: 16px; bottom: 16px; z-index: 9999;
+      position: fixed; right: 16px; bottom: 16px; z-index: 99999;
       padding: 8px 14px; border-radius: 6px;
       border: 1px solid rgba(120,120,120,0.4);
       background: rgba(30,30,30,0.85); color: #fff;
@@ -43,180 +61,182 @@
     }
     #${BTN_ID}:hover { background: rgba(50,50,50,0.95); }
     #${BTN_ID}[data-active="true"] { background: #0078d4; border-color: #0078d4; }
+    #${BTN_ID}[disabled] { opacity: 0.6; cursor: progress; }
   `;
   document.head.appendChild(style);
 
+  // ─── Helpers ─────────────────────────────────────────────────────────────
   const isHidden = () => localStorage.getItem(STORAGE_KEY) === '1';
-  const getScrollTop = () => document.querySelector(LOG_READER_SEL)?.scrollTop || 0;
+  const getScroller = () => document.querySelector(LOG_READER_SEL);
+  const getList = () => document.querySelector(LOG_READER_SEL + ' > ' + LIST_SEL)
+    || document.querySelector(LIST_SEL);
+  const getTaskKey = () => {
+    try { return new URL(location.href).searchParams.get('t') || ''; } catch { return ''; }
+  };
 
-  function lineInfo(slot) {
-    const lineRow = slot.querySelector('.line-row');
-    if (!lineRow) return null;
+  function lineMeta(slot) {
+    const lr = slot.querySelector('.line-row');
+    if (!lr) return null;
     const el = slot.querySelector('[data-line]');
     if (!el) return null;
     const lineIdx = parseInt(el.getAttribute('data-line'));
     if (isNaN(lineIdx)) return null;
-    return { lineRow, lineIdx, lsec: el.getAttribute('data-lsec') || '', key: (el.getAttribute('data-lsec') || '') + ':' + lineIdx };
+    const lsec = el.getAttribute('data-lsec') || '';
+    return { lr, lineIdx, lsec, key: lsec + ':' + lineIdx };
   }
 
   function captureSlot(slot) {
-    const info = lineInfo(slot);
-    if (!info) return;
-    const text = info.lineRow.textContent || '';
+    const m = lineMeta(slot);
+    if (!m) return;
+    const text = m.lr.textContent || '';
     const isDebug = text.trimStart().startsWith(DEBUG_MARKER);
-    if (isDebug) info.lineRow.classList.add(DEBUG_LINE_CLASS);
-    const existing = lineMap.get(info.key);
-    if (!existing || existing.isDebug !== isDebug) {
-      lineMap.set(info.key, { lineIdx: info.lineIdx, lsec: info.lsec, isDebug });
-    }
+    const prev = extracted.get(m.key);
+    // Only re-clone if not yet captured (initial render) or text grew
+    // (ADO sometimes paints lines progressively for live jobs).
+    if (prev && prev.text.length >= text.length) return;
+    const clone = m.lr.cloneNode(true);
+    extracted.set(m.key, { lineIdx: m.lineIdx, lsec: m.lsec, isDebug, text, clone });
+    if (!lsecOrder.includes(m.lsec)) lsecOrder.push(m.lsec);
   }
 
-  function captureAll() {
-    const slots = Array.from(document.querySelectorAll(SLOT_SEL));
-    for (const s of slots) captureSlot(s);
-    // Detect rowHeight from ADO's set tops (skip slots we've already overridden).
-    const samples = [];
-    for (const s of slots) {
-      if (s.dataset.tmAppliedTop) continue;
-      const info = lineInfo(s);
-      if (!info) continue;
-      const t = parseFloat(s.style.top);
-      if (!isNaN(t)) samples.push({ idx: info.lineIdx, top: t });
-    }
-    if (samples.length >= 2) {
-      samples.sort((a, b) => a.idx - b.idx);
-      for (let i = 1; i < samples.length; i++) {
-        const dIdx = samples[i].idx - samples[i - 1].idx;
-        const dTop = samples[i].top - samples[i - 1].top;
-        if (dIdx > 0 && dTop > 0) {
-          const rh = dTop / dIdx;
-          if (rh > 5 && rh < 60) { rowHeight = rh; return; }
-        }
-      }
-    }
+  function captureAllVisible() {
+    document.querySelectorAll(SLOT_SEL).forEach(captureSlot);
   }
 
-  let packing = false;
+  // ─── Extraction (auto-scroll) ────────────────────────────────────────────
+  function waitFor(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-  // anchor = current scrollTop. Visible non-debug rows in the rendered batch are
-  // placed at anchor, anchor+rowHeight, ... — so they always sit at the top of the
-  // viewport. No leading whitespace where hidden debug rows used to live.
-  // Side effect: scrollbar reflects ADO's original log length, not the filtered one.
-  // You'll scroll over a larger range than the visible content suggests; ADO's
-  // virtualizer will render new batches as you go, and we pack each batch.
-  function applyPack() {
-    if (packing) return;
-    if (!isHidden()) return;
-    packing = true;
-    try {
-      const slots = Array.from(document.querySelectorAll(SLOT_SEL));
-      const items = [];
-      for (const s of slots) {
-        const info = lineInfo(s);
-        if (!info) continue;
-        const entry = lineMap.get(info.key);
-        if (!entry) continue;
-        items.push({ s, info, isDebug: entry.isDebug });
-      }
-      if (items.length === 0) return;
-      items.sort((a, b) => a.info.lineIdx - b.info.lineIdx);
+  async function runExtraction(progressCb) {
+    extractAbort = false;
+    const sc = getScroller();
+    if (!sc) throw new Error('log-reader not found');
+    savedScrollTop = sc.scrollTop;
+    const total = sc.scrollHeight;
+    const stepPx = Math.max(sc.clientHeight - 100, 400);
 
-      const anchor = getScrollTop();
-
-      let i = 0;
-      for (const it of items) {
-        if (it.isDebug) continue;
-        const target = anchor + i * rowHeight;
-        const ts = target + 'px';
-        if (it.s.style.top !== ts) it.s.style.setProperty('top', ts);
-        it.s.dataset.tmAppliedTop = String(target);
-        i++;
-      }
-    } finally {
-      packing = false;
+    captureAllVisible();
+    let pos = 0;
+    while (pos < total) {
+      if (extractAbort) return;
+      pos = Math.min(pos + stepPx, total);
+      sc.scrollTop = pos;
+      // Programmatic scrollTop alone doesn't trigger ADO's virtualizer —
+      // it needs a scroll event to react.
+      sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await waitFor(300);
+      captureAllVisible();
+      if (progressCb) progressCb(Math.min(pos / total, 1));
     }
+    // One more pass at the very bottom (in case the last step undershot).
+    sc.scrollTop = total;
+    sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+    await waitFor(400);
+    captureAllVisible();
+    // Restore user's scroll. ADO will render the original viewport-batch back.
+    sc.scrollTop = savedScrollTop;
+    sc.dispatchEvent(new Event('scroll', { bubbles: true }));
   }
 
-  function applyRestore() {
-    if (packing) return;
-    packing = true;
-    try {
-      document.querySelectorAll(SLOT_SEL + '[data-tm-applied-top]').forEach((s) => {
-        const info = lineInfo(s);
-        if (info) s.style.setProperty('top', (info.lineIdx - 1) * rowHeight + 'px');
-        delete s.dataset.tmAppliedTop;
+  // ─── Custom compact view ─────────────────────────────────────────────────
+  function ensureCompactContainer() {
+    let c = document.getElementById(COMPACT_ID);
+    if (c) return c;
+    const sc = getScroller();
+    if (!sc) return null;
+    c = document.createElement('div');
+    c.id = COMPACT_ID;
+    sc.appendChild(c);
+    return c;
+  }
+
+  function renderCompact() {
+    const c = ensureCompactContainer();
+    if (!c) return;
+    c.replaceChildren();
+    // Sort: lsec in observed order, lineIdx ascending within lsec
+    const lsecIndex = new Map(lsecOrder.map((s, i) => [s, i]));
+    const list = Array.from(extracted.values())
+      .filter((e) => !e.isDebug)
+      .sort((a, b) => {
+        const la = lsecIndex.get(a.lsec) ?? 99999;
+        const lb = lsecIndex.get(b.lsec) ?? 99999;
+        if (la !== lb) return la - lb;
+        return a.lineIdx - b.lineIdx;
       });
-    } finally {
-      packing = false;
+    const frag = document.createDocumentFragment();
+    for (const e of list) {
+      const wrap = document.createElement('div');
+      wrap.className = 'tm-ado-compact-row';
+      wrap.dataset.key = e.lsec + ':' + e.lineIdx;
+      // Clone the captured line-row HTML structure so colors/links/spans carry over.
+      wrap.appendChild(e.clone.cloneNode(true));
+      frag.appendChild(wrap);
+    }
+    c.appendChild(frag);
+  }
+
+  function appendNewNonDebugIfMissing(key) {
+    const e = extracted.get(key);
+    if (!e || e.isDebug) return;
+    const c = document.getElementById(COMPACT_ID);
+    if (!c) return;
+    if (c.querySelector(`.tm-ado-compact-row[data-key="${CSS.escape(key)}"]`)) return;
+    // For live appends, just append at the end. Re-render later for proper ordering
+    // if needed; in practice live job logs only grow forward.
+    const wrap = document.createElement('div');
+    wrap.className = 'tm-ado-compact-row';
+    wrap.dataset.key = key;
+    wrap.appendChild(e.clone.cloneNode(true));
+    c.appendChild(wrap);
+  }
+
+  // ─── Toggle handlers ─────────────────────────────────────────────────────
+  function setBtn(btn, label, opts = {}) {
+    btn.textContent = label;
+    btn.disabled = !!opts.disabled;
+    if (opts.active !== undefined) btn.dataset.active = opts.active ? 'true' : 'false';
+  }
+
+  async function enterCompact(btn) {
+    if (state === 'extracting' || state === 'compact') return;
+    state = 'extracting';
+    setBtn(btn, 'Extracting 0%…', { disabled: true, active: true });
+    try {
+      await runExtraction((p) => setBtn(btn, `Extracting ${Math.round(p * 100)}%…`, { disabled: true, active: true }));
+    } catch (err) {
+      console.warn('[ado-hide-debug] extraction failed:', err);
+    }
+    if (extractAbort) {
+      state = 'off';
+      setBtn(btn, 'Hide ##[debug]', { disabled: false, active: false });
+      return;
+    }
+    renderCompact();
+    document.body.classList.add(BTN_ID + '-compact-on');
+    state = 'compact';
+    setBtn(btn, 'Show ##[debug]', { disabled: false, active: true });
+  }
+
+  function exitCompact(btn) {
+    document.body.classList.remove(BTN_ID + '-compact-on');
+    const c = document.getElementById(COMPACT_ID);
+    if (c) c.replaceChildren();
+    state = 'off';
+    setBtn(btn, 'Hide ##[debug]', { disabled: false, active: false });
+  }
+
+  function onToggleClick(btn) {
+    if (state === 'extracting') return; // ignore
+    if (state === 'off') {
+      localStorage.setItem(STORAGE_KEY, '1');
+      enterCompact(btn);
+    } else if (state === 'compact') {
+      localStorage.setItem(STORAGE_KEY, '0');
+      exitCompact(btn);
     }
   }
 
-  // Coalesce observer-driven + scroll-driven work into one rAF. Direct synchronous
-  // re-entry races with ADO's React-based render cycle and freezes the page.
-  let scheduled = false;
-  function schedule() {
-    if (scheduled) return;
-    scheduled = true;
-    requestAnimationFrame(() => {
-      scheduled = false;
-      captureAll();
-      if (isHidden()) applyPack();
-      else applyRestore();
-    });
-  }
-
-  const obs = new MutationObserver((muts) => {
-    if (packing) return;
-    let touched = false;
-    for (const m of muts) {
-      if (m.type === 'childList') {
-        m.addedNodes.forEach((n) => {
-          if (n instanceof Element && (n.classList?.contains('line-row') || n.matches?.(SLOT_SEL) || n.querySelector?.('.line-row'))) {
-            touched = true;
-          }
-        });
-      } else if (m.type === 'characterData') {
-        if (m.target.parentElement?.closest?.('.line-row')) touched = true;
-      } else if (m.type === 'attributes' && m.attributeName === 'style') {
-        if (m.target instanceof Element && m.target.classList.contains('bolt-fixed-height-list-row')) touched = true;
-      }
-    }
-    if (touched) schedule();
-  });
-
-  function startObserving() {
-    obs.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: ['style'],
-    });
-    // Also re-pack on scroll — scroll alone may not produce DOM mutations if the
-    // rendered batch is wide enough to span the entire visible delta.
-    const attachScroll = () => {
-      const sc = document.querySelector(LOG_READER_SEL);
-      if (sc && !sc.dataset.tmScrollHooked) {
-        sc.addEventListener('scroll', schedule, { passive: true });
-        sc.dataset.tmScrollHooked = '1';
-      }
-    };
-    attachScroll();
-    // The log-reader may not exist on initial load (SPA); poll until it appears.
-    let attempts = 0;
-    const tick = setInterval(() => {
-      attachScroll();
-      attempts++;
-      if (attempts > 60) clearInterval(tick); // ~30s
-    }, 500);
-  }
-
-  function updateBtn(btn) {
-    const hidden = isHidden();
-    btn.dataset.active = hidden ? 'true' : 'false';
-    btn.textContent = hidden ? 'Show ##[debug]' : 'Hide ##[debug]';
-  }
-
+  // ─── Button ──────────────────────────────────────────────────────────────
   function ensureBtn() {
     let btn = document.getElementById(BTN_ID);
     if (btn) return btn;
@@ -224,24 +244,63 @@
     btn.id = BTN_ID;
     btn.type = 'button';
     btn.title = 'Toggle ##[debug] log lines (all jobs/tasks/stages)';
-    btn.addEventListener('click', () => {
-      localStorage.setItem(STORAGE_KEY, isHidden() ? '0' : '1');
-      document.body.classList.toggle(HIDE_CLASS, isHidden());
-      updateBtn(btn);
-      if (isHidden()) applyPack();
-      else applyRestore();
-    });
+    setBtn(btn, 'Hide ##[debug]', { disabled: false, active: false });
+    btn.addEventListener('click', () => onToggleClick(btn));
     document.body.appendChild(btn);
     return btn;
   }
 
+  // ─── Task switch / live append ───────────────────────────────────────────
+  function onTaskChange(btn) {
+    extractAbort = true;
+    extracted = new Map();
+    lsecOrder = [];
+    exitCompact(btn);
+    // Don't auto-extract for the new task — user opts in by clicking Hide.
+    // Reset the persisted flag so they get a clean Show state on load.
+    localStorage.setItem(STORAGE_KEY, '0');
+  }
+
+  // Live captures (job streaming new lines while in compact mode).
+  function onMutation(btn, muts) {
+    let touched = false;
+    for (const m of muts) {
+      if (m.type === 'childList') {
+        m.addedNodes.forEach((n) => {
+          if (!(n instanceof Element)) return;
+          if (n.matches && n.matches(SLOT_SEL)) { captureSlot(n); touched = true; }
+          else if (n.querySelectorAll) n.querySelectorAll(SLOT_SEL).forEach((s) => { captureSlot(s); touched = true; });
+        });
+      } else if (m.type === 'characterData') {
+        const slot = m.target.parentElement?.closest?.(SLOT_SEL);
+        if (slot) { captureSlot(slot); touched = true; }
+      }
+    }
+    if (touched && state === 'compact') {
+      // Append newly-seen non-debug lines to compact view (no re-render).
+      for (const [k, e] of extracted) {
+        if (!e.isDebug) appendNewNonDebugIfMissing(k);
+      }
+    }
+  }
+
   function init() {
     const btn = ensureBtn();
-    document.body.classList.toggle(HIDE_CLASS, isHidden());
-    updateBtn(btn);
-    captureAll();
-    if (isHidden()) applyPack();
-    startObserving();
+    currentTaskKey = getTaskKey();
+    // Don't auto-restore "hidden" on load — extraction takes a couple seconds
+    // and surprising the user with auto-scroll is rude. Reset to Show by default.
+    if (isHidden()) localStorage.setItem(STORAGE_KEY, '0');
+
+    const obs = new MutationObserver((muts) => onMutation(btn, muts));
+    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+    setInterval(() => {
+      const k = getTaskKey();
+      if (k && k !== currentTaskKey) {
+        currentTaskKey = k;
+        onTaskChange(btn);
+      }
+    }, 500);
   }
 
   if (document.readyState === 'loading') {
